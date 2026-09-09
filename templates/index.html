@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width,initial-scale=1.0">
+        <link rel="stylesheet" href="https://unpkg.com/neat.style/neat.min.css">
+    </head>
+    <body>
+        <form method="POST" action="http://127.0.0.1:5000/api">
+            <label for="youtube-form">Enter Youtube Link - 5 minutes or below</label>
+            <input type="url" id="youtube-form" name="ytlink"/>
+            <button type="submit">Submit</button>
+        </form>
+    </body>
+    <script>
+    document.querySelector("form").addEventListener("submit", function(e) {
+        const input = document.getElementById("youtube-form");
+        if (!input.value.includes("youtube.com") && !input.value.includes("youtu.be")) {
+            e.preventDefault();
+            alert("Please enter a valid YouTube link.");
+        }
+    });
+</script>
+</html>
