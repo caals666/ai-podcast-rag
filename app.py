@@ -2,6 +2,8 @@ from flask import Flask, request, render_template
 import yt_dlp, re, os, io
 import whisper, json, mariadb
 from dotenv import load_dotenv
+from groq import Groq
+import ast
 
 load_dotenv()
 
@@ -17,6 +19,31 @@ YOUTUBE_PATTERN = re.compile(
 )
 
 MAX_DURATION_SECONDS = 5 * 60  # 5 minutes, matches the UI label
+
+def groq_keys(text):
+
+    client = Groq(
+        api_key=os.getenv("GROQ_API_KEY"),
+    )
+
+    chat_completion = client.chat.completions.create(
+        messages=[
+            {
+                "role": "user",
+                "content": f"""Extract 5 distinct, descriptive phrases (3-6 words) representing the key chronological sections of this transcript.
+                            Return ONLY a Python list of strings, no explanation, no markdown, no code fences.
+
+                            Example: ["phrase one here", "phrase two here", "phrase three here", "phrase four here", "phrase five here"]
+
+                            Transcript:
+                            {text}
+                            """,
+            }
+        ],
+        model="openai/gpt-oss-20b",
+    )
+
+    return ast.literal_eval(chat_completion.choices[0].message.content.strip())
 
 def insert_db(video_id, whisper_result):
     # 1. Connect
@@ -64,27 +91,6 @@ def insert_db(video_id, whisper_result):
     cursor.close()
     conn.close()
 
-def extract_video_id(url):
-    # This regex looks for the 11-character ID in common YouTube patterns
-    pattern = r'(?:v=|\/)([0-9A-Za-z_-]{11})(?:[?&]|$)'
-    match = re.search(pattern, url)
-    return match.group(1) if match else None
-
-def validate_youtube_url(url: str) -> tuple[bool, str | None]:
-    """
-    Returns (is_valid, video_id).
-    Strips whitespace and quotes from input.
-    """
-    if not url:
-        return False, None
-
-    cleaned = url.strip().strip('"').strip("'")
-    print(cleaned)
-    match = YOUTUBE_PATTERN.search(cleaned)
-    if match:
-        return True, match.group(1)
-    return False, None
-
 
 def yt_dlp_download(yt_link: str) -> str:
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
@@ -125,7 +131,7 @@ def yt_dlp_download(yt_link: str) -> str:
 
         info = ydl.extract_info(yt_link, download=True)
         f_name = ydl.prepare_filename(info)
-        return os.path.splitext(f_name)[0] + '.mp3'
+        return os.path.splitext(f_name)[0] + '.mp3',info['id']
 
 def transcribe_audio(file_path, language="en"):
     model=whisper.load_model("base")
@@ -140,22 +146,14 @@ def transcribe_audio(file_path, language="en"):
 def index():
     return render_template('index.html')
 
-
 @app.route('/api', methods=['POST'])
 def api():
-    yt_link = request.form.get('ytlink', '')
+    yt_link = request.form.get('ytlink')
 
-    is_valid, video_id = validate_youtube_url(yt_link)
-    if not is_valid:
-        return _result_page(
-            "❌ Invalid link",
-            "That doesn't look like a valid YouTube URL. Please go back and try again.",
-        ), 400
-
-    print(f"Starting download for video {video_id}...")
+    video_id=''
 
     try:
-        f_name = yt_dlp_download(yt_link)
+        f_name,video_id = yt_dlp_download(yt_link)
     except ValueError as e:
         # Our own validation errors (e.g. too long)
         return _result_page("❌ Can't download that one", str(e)), 400
@@ -171,10 +169,6 @@ def api():
         return _result_page("❌ Something went wrong", "Unexpected server error. Check the logs."), 500
     
     print("Download finished:", f_name)
-    
-    video_id = extract_video_id(yt_link)
-    if not video_id:
-        return json.dumps(({"error": "Invalid YouTube URL"}),indent=4), 400
 
     transcription = transcribe_audio(f_name)
     with open(os.path.join(BASE_DIR,"transcript/transcript.txt"), "w", encoding="utf-8") as f:
@@ -182,9 +176,15 @@ def api():
 
     insert_db(video_id,transcription)
 
+    keywords=groq_keys(transcription['text'])
+
+    display_keyword=''
+    for i in keywords:
+        display_keyword+=i+'\n';
+
     return _result_page(
         "✅ Transcription complete",
-        f"{transcription}",
+        f"{display_keyword}",
     )
 
 def _result_page(title: str, message: str) -> str:
@@ -193,7 +193,6 @@ def _result_page(title: str, message: str) -> str:
         <p>{message}</p>
         <a href="/">Go back</a>
     '''
-
 
 if __name__ == '__main__':
     app.run(debug=True)
