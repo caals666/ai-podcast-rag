@@ -2,7 +2,6 @@ from flask import Flask, request, render_template
 import yt_dlp, re, os, io
 import whisper, json, mariadb
 from dotenv import load_dotenv
-from sentence_transformers import SentenceTransformer, util
 
 load_dotenv()
 
@@ -18,6 +17,31 @@ YOUTUBE_PATTERN = re.compile(
 )
 
 MAX_DURATION_SECONDS = 5 * 60  # 5 minutes, matches the UI label
+
+def groq_keys(text):
+
+    client = Groq(
+        api_key=os.getenv("GROQ_API_KEY"),
+    )
+
+    chat_completion = client.chat.completions.create(
+        messages=[
+            {
+                "role": "user",
+                "content": f"""Extract 5 distinct, descriptive phrases (3-6 words) representing the key chronological sections of this transcript.
+                            Return ONLY a Python list of strings, no explanation, no markdown, no code fences.
+
+                            Example: ["phrase one here", "phrase two here", "phrase three here", "phrase four here", "phrase five here"]
+
+                            Transcript:
+                            {text}
+                            """,
+            }
+        ],
+        model="openai/gpt-oss-20b",
+    )
+
+    return ast.literal_eval(chat_completion.choices[0].message.content.strip())
 
 def insert_db(video_id, whisper_result):
     # 1. Connect
@@ -70,46 +94,6 @@ def extract_video_id(url):
     pattern = r'(?:v=|\/)([0-9A-Za-z_-]{11})(?:[?&]|$)'
     match = re.search(pattern, url)
     return match.group(1) if match else None
-
-def sentence_transformer():
-        # Here we are importing the SentenceTransformer class to load pre-trained models
-    # and util for similarity functions like cosine similarity
-    
-
-    # After import the require librariries, we are loading a pre-trained model that can turn sentences into vector embeddings
-    # This model is coming from huggingface, which is light but fast to capture good semantic meaning
-    model = SentenceTransformer('all-MiniLM-L6-v2')
-
-    # Define FAQs - Here we are taking a example list of FAQ sentences that users might ask on a website and possible answers we'll search through
-    faqs = [
-        "How can I book a doctor appointment?",
-        "What insurance plans are accepted?",
-        "How do I reset my password?",
-        "Where can I find my lab test results?",
-        "How do I update my personal information?"
-    ]
-
-    # Than we convert each FAQ into an embedding vector (a numeric representation of meaning)
-    faq_embeddings = model.encode(faqs)
-
-    # Here we are taking the User query, which is also encoded into another embedding vector
-    query = "How to schedule a physician visit?"
-    query_embedding = model.encode(query)
-
-    # Here 'cos_sim' Compares and compute similarity scores for the query embedding with every FAQ embedding using cosine similarity (a measure of closeness between vectors)
-    # Higher scores mean higher semantic similarity.
-    cosine_scores = util.cos_sim(query_embedding, faq_embeddings)
-
-    # Here 'argmax()' helps to find best match by finding the FAQ with the highest similarity score
-    best_match_idx = cosine_scores.argmax()
-
-    # Prints the query and the closest matching FAQ
-    print("Query:", query)
-    print("Best Match:", faqs[best_match_idx])
-
-    # Further we can fetch the similarity score and print the score as well
-    best_score = cosine_scores[0][best_match_idx].item()  # extract float
-    print("Cosine similarity score between these sentences:", round(best_score,3))
 
 def validate_youtube_url(url: str) -> tuple[bool, str | None]:
     """
@@ -166,7 +150,7 @@ def yt_dlp_download(yt_link: str) -> str:
 
         info = ydl.extract_info(yt_link, download=True)
         f_name = ydl.prepare_filename(info)
-        return os.path.splitext(f_name)[0] + '.mp3'
+        return os.path.splitext(f_name)[0] + '.mp3',info['id']
 
 def transcribe_audio(file_path, language="en"):
     model=whisper.load_model("base")
@@ -181,22 +165,14 @@ def transcribe_audio(file_path, language="en"):
 def index():
     return render_template('index.html')
 
-
 @app.route('/api', methods=['POST'])
 def api():
-    yt_link = request.form.get('ytlink', '')
+    yt_link = request.form.get('ytlink')
 
-    is_valid, video_id = validate_youtube_url(yt_link)
-    if not is_valid:
-        return _result_page(
-            "❌ Invalid link",
-            "That doesn't look like a valid YouTube URL. Please go back and try again.",
-        ), 400
-
-    print(f"Starting download for video {video_id}...")
+    video_id=''
 
     try:
-        f_name = yt_dlp_download(yt_link)
+        f_name,video_id = yt_dlp_download(yt_link)
     except ValueError as e:
         # Our own validation errors (e.g. too long)
         return _result_page("❌ Can't download that one", str(e)), 400
@@ -212,10 +188,6 @@ def api():
         return _result_page("❌ Something went wrong", "Unexpected server error. Check the logs."), 500
     
     print("Download finished:", f_name)
-    
-    video_id = extract_video_id(yt_link)
-    if not video_id:
-        return json.dumps(({"error": "Invalid YouTube URL"}),indent=4), 400
 
     transcription = transcribe_audio(f_name)
     with open(os.path.join(BASE_DIR,"transcript/transcript.txt"), "w", encoding="utf-8") as f:
@@ -223,9 +195,15 @@ def api():
 
     insert_db(video_id,transcription)
 
+    keywords=groq_keys(transcription['text'])
+
+    display_keyword=''
+    for i in keywords:
+        display_keyword+=i+'\n';
+
     return _result_page(
         "✅ Transcription complete",
-        f"{transcription}",
+        f"{display_keyword}",
     )
 
 def _result_page(title: str, message: str) -> str:
@@ -234,7 +212,6 @@ def _result_page(title: str, message: str) -> str:
         <p>{message}</p>
         <a href="/">Go back</a>
     '''
-
 
 if __name__ == '__main__':
     app.run(debug=True)
