@@ -2,14 +2,23 @@ from flask import Flask, request, render_template
 import yt_dlp, re, os, io
 import whisper, json, mariadb
 from dotenv import load_dotenv
+from groq import Groq
+import ast
+from sentence_transformers import SentenceTransformer, util
+import json
+from flask_caching import Cache
 
 load_dotenv()
 
 app = Flask(__name__)
+app.config["CACHE_TYPE"]="SimpleCache"
+app.config["CACHE_DEFAULT_TIMOUT"]=3600
+cache=Cache(app)
 
 # Base directory = wherever this script lives, so paths work on any machine
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DOWNLOAD_DIR = os.path.join(BASE_DIR, "downloads")
+TRANSCRIPT_PATH = os.path.join(BASE_DIR, 'transcript', 'transcript.txt')
 COOKIES_FILE = os.path.join(BASE_DIR, "cookies.txt")  # put cookies.txt next to app.py
 
 YOUTUBE_PATTERN = re.compile(
@@ -17,6 +26,29 @@ YOUTUBE_PATTERN = re.compile(
 )
 
 MAX_DURATION_SECONDS = 5 * 60  # 5 minutes, matches the UI label
+
+def timestamp(keywords):
+    model = SentenceTransformer('all-MiniLM-L6-v2')
+    raw={}
+    with open(TRANSCRIPT_PATH,'r') as f:
+        raw = json.load(f)
+
+    corpus = [segment['text'] for segment in raw['segments']]
+
+    queries = keywords
+
+    query_embeddings = model.encode(queries,convert_to_tensor=True)
+    corpus_embeddings = model.encode(corpus,convert_to_tensor=True)
+
+    cosine_scores = util.cos_sim(query_embeddings,corpus_embeddings)
+
+    res=[]
+
+    for i,query in enumerate(queries):
+        max_idx = cosine_scores[i].argmax().item()
+        res.append(raw['segments'][max_idx]['start'])
+
+    return res
 
 def groq_keys(text):
 
@@ -28,14 +60,24 @@ def groq_keys(text):
         messages=[
             {
                 "role": "user",
-                "content": f"""Extract 5 distinct, descriptive phrases (3-6 words) representing the key chronological sections of this transcript.
-                            Return ONLY a Python list of strings, no explanation, no markdown, no code fences.
+                "content": f"""You are analyzing a video transcript to generate chapter-style navigation labels.
 
-                            Example: ["phrase one here", "phrase two here", "phrase three here", "phrase four here", "phrase five here"]
+    Extract exactly 5 distinct phrases (3-6 words each) that represent the key chronological sections of SUBSTANTIVE CONTENT in this transcript — the actual information, topics, or ideas being taught or discussed.
 
-                            Transcript:
-                            {text}
-                            """,
+    Rules:
+    - Order the phrases exactly as they occur in the transcript, start to finish.
+    - Only include moments where real content is being delivered (explanations, demonstrations, key points, topic transitions).
+    - EXCLUDE: intros/greetings, sponsor reads, ads, calls to action (like/subscribe/survey links), outros, filler, tangents about the creator's personal life, and any meta-commentary about the video itself.
+    - Each phrase must be specific enough to distinguish it from the others — avoid vague phrases like "more details" or "continuing on".
+    - Do not pick two phrases from the same narrow moment; spread them across the full length of the transcript.
+
+    Return ONLY a Python list of strings, no explanation, no markdown, no code fences.
+
+    Example: ["phrase one here", "phrase two here", "phrase three here", "phrase four here", "phrase five here"]
+
+    Transcript:
+    {text}
+    """
             }
         ],
         model="openai/gpt-oss-20b",
@@ -43,57 +85,66 @@ def groq_keys(text):
 
     return ast.literal_eval(chat_completion.choices[0].message.content.strip())
 
-def insert_db(video_id, whisper_result):
-    # 1. Connect
-    conn = mariadb.connect(host=os.getenv('DB_HOST'), user=os.getenv('DB_USER'), password=os.getenv('DB_PASSWORD'), database=os.getenv('DB_NAME'))
-    cursor = conn.cursor()
+def get_or_process_video(video_id, transcription_text):
+    cache_key = f"{video_id}"
+    cached = cache.get(cache_key)
 
-    # 2. Create table
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS video_data (
-            id INT AUTO_INCREMENT PRIMARY KEY,
-            video_id VARCHAR(20) NOT NULL,
-            segment_text TEXT NOT NULL,
-            start_time DECIMAL(10,3) NOT NULL,
-            end_time DECIMAL(10,3) NOT NULL,
-            timestamped_url VARCHAR(255) NOT NULL,
-            embeddings JSON NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            INDEX idx_video_id (video_id)
-        )
-    """)
-    conn.commit()
+    if cached is not None:
+        return cached['keywords'], cached['timestamps']
 
-    # 3. Insert one row (put your actual values here)
-    insert_sql = """
-        INSERT INTO video_data 
-        (video_id, segment_text, start_time, end_time, timestamped_url, embeddings)
-        VALUES (?, ?, ?, ?, ?, ?)
-    """
+    # Not cached — do the actual work
+    keywords = groq_keys(transcription_text)
+    timestamps = timestamp(keywords)
 
-    rows_to_insert = []
-    for segment in whisper_result['segments']:
-        start = segment['start']
-        end = segment['end']
-        text = segment['text'].strip()
-        timestamped_url=f"https://youtube.com/watch?v={video_id}&t={int(start)}s"
+    cache.set(cache_key, {'keywords': keywords, 'timestamps': timestamps})
 
-        rows_to_insert.append((video_id,text,start,end,timestamped_url,None))
+    return keywords, timestamps
 
-    if rows_to_insert:
-        cursor.executemany(insert_sql,rows_to_insert)
-        conn.commit()
-        print(f"✅ Successfully inserted {len(rows_to_insert)} segments into the database.")
+# def insert_db(video_id, whisper_result):
+#     # 1. Connect
+#     conn = mariadb.connect(host=os.getenv('DB_HOST'), user=os.getenv('DB_USER'), password=os.getenv('DB_PASSWORD'), database=os.getenv('DB_NAME'))
+#     cursor = conn.cursor()
 
-    # 4. Close
-    cursor.close()
-    conn.close()
+#     # 2. Create table
+#     cursor.execute("""
+#         CREATE TABLE IF NOT EXISTS video_data (
+#             id INT AUTO_INCREMENT PRIMARY KEY,
+#             video_id VARCHAR(20) NOT NULL,
+#             segment_text TEXT NOT NULL,
+#             start_time DECIMAL(10,3) NOT NULL,
+#             end_time DECIMAL(10,3) NOT NULL,
+#             timestamped_url VARCHAR(255) NOT NULL,
+#             embeddings JSON NULL,
+#             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+#             INDEX idx_video_id (video_id)
+#         )
+#     """)
+#     conn.commit()
 
-def extract_video_id(url):
-    # This regex looks for the 11-character ID in common YouTube patterns
-    pattern = r'(?:v=|\/)([0-9A-Za-z_-]{11})(?:[?&]|$)'
-    match = re.search(pattern, url)
-    return match.group(1) if match else None
+#     # 3. Insert one row (put your actual values here)
+#     insert_sql = """
+#         INSERT INTO video_data 
+#         (video_id, segment_text, start_time, end_time, timestamped_url, embeddings)
+#         VALUES (?, ?, ?, ?, ?, ?)
+#     """
+
+#     rows_to_insert = []
+#     for segment in whisper_result['segments']:
+#         start = segment['start']
+#         end = segment['end']
+#         text = segment['text'].strip()
+#         timestamped_url=f"https://youtube.com/watch?v={video_id}&t={int(start)}s"
+
+#         rows_to_insert.append((video_id,text,start,end,timestamped_url,None))
+
+#     if rows_to_insert:
+#         cursor.executemany(insert_sql,rows_to_insert)
+#         conn.commit()
+#         print(f"✅ Successfully inserted {len(rows_to_insert)} segments into the database.")
+
+#     # 4. Close
+#     cursor.close()
+#     conn.close()
 
 def validate_youtube_url(url: str) -> tuple[bool, str | None]:
     """
@@ -161,55 +212,74 @@ def transcribe_audio(file_path, language="en"):
     except Exception as e:
         raise Exception(f"Transcription failed: {str(e)}")
 
+def get_video_id(url):
+    ydl_opts = {
+        'quiet': True,
+        'skip_download': True,
+        'extract_flat': True,  # avoids resolving full formats, just metadata
+    }
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+        return info['id']
+
 @app.route('/')
 def index():
     return render_template('index.html')
 
 @app.route('/api', methods=['POST'])
 def api():
+    keywords=[]
+    timestamps=[]
     yt_link = request.form.get('ytlink')
 
-    video_id=''
+    video_id=get_video_id(yt_link)
 
-    try:
-        f_name,video_id = yt_dlp_download(yt_link)
-    except ValueError as e:
-        # Our own validation errors (e.g. too long)
-        return _result_page("❌ Can't download that one", str(e)), 400
-    except yt_dlp.utils.DownloadError as e:
-        print("yt-dlp error:", e)
-        return _result_page(
-            "❌ Download failed",
-            "yt-dlp couldn't fetch that video. It may be private, age-restricted, "
-            "region-locked, or your cookies.txt may have expired.",
-        ), 502
-    except Exception as e:
-        print("Unexpected error:", e)
-        return _result_page("❌ Something went wrong", "Unexpected server error. Check the logs."), 500
-    
-    print("Download finished:", f_name)
+    cached=cache.get(video_id)
 
-    transcription = transcribe_audio(f_name)
-    with open(os.path.join(BASE_DIR,"transcript/transcript.txt"), "w", encoding="utf-8") as f:
-        f.write(str(transcription))
+    if(cached is not None):
+        keywords,timestamps =cached['keywords'], cached['timestamps']
 
-    insert_db(video_id,transcription)
+    else:
+        try:
+            f_name,video_id = yt_dlp_download(yt_link)
+        except ValueError as e:
+            # Our own validation errors (e.g. too long)
+            return _result_page("❌ Can't download that one", str(e)), 400
+        except yt_dlp.utils.DownloadError as e:
+            print("yt-dlp error:", e)
+            return _result_page(
+                "❌ Download failed",
+                "yt-dlp couldn't fetch that video. It may be private, age-restricted, "
+                "region-locked, or your cookies.txt may have expired.",
+            ), 502
+        except Exception as e:
+            print("Unexpected error:", e)
+            return _result_page("❌ Something went wrong", "Unexpected server error. Check the logs."), 500
+        
+        print("Download finished:", f_name)
 
-    keywords=groq_keys(transcription['text'])
+        transcription = transcribe_audio(f_name)
+        with open(os.path.join(BASE_DIR,"transcript/transcript.txt"), "w", encoding="utf-8") as f:
+            json.dump(transcription,f)
 
-    display_keyword=''
-    for i in keywords:
-        display_keyword+=i+'\n';
+        # insert_db(video_id,transcription)
+
+        keywords, timestamps = get_or_process_video(video_id,transcription['text'])
+
+    display_keyword = ''
+    for idx,keyword in enumerate(keywords):
+        display_keyword += f'<li><a href="https://youtu.be/{video_id}?t={int(timestamps[idx])}">{keyword}</a></li>'
 
     return _result_page(
         "✅ Transcription complete",
-        f"{display_keyword}",
+        f"<ol>{display_keyword}</ol>",
+        video_id
     )
 
-def _result_page(title: str, message: str) -> str:
+def _result_page(title: str, message: str,video_id:str) -> str:
     return f'''
         <h1>{title}</h1>
-        <p>{message}</p>
+        {message}
         <a href="/">Go back</a>
     '''
 

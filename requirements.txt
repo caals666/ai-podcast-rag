@@ -1,0 +1,8 @@
+Flask
+Flask-Caching
+yt-dlp
+openai-whisper
+mariadb
+python-dotenv
+groq
+sentence-transformers
